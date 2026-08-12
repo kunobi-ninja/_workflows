@@ -1,0 +1,696 @@
+name: Reusable Rust Release
+
+on:
+  workflow_call:
+    inputs:
+      binary_name:
+        # Defaults to "kache" so this workflow stays a strict no-op for the
+        # original (kache) behavior when a caller omits it — archive/.exe/.deb
+        # naming all fall back to kache. New consumers (e.g. kobe) set it.
+        description: "Name of the binary to build (archive/.deb naming: {name}-{target}). Defaults to kache for backward-compatibility."
+        required: false
+        default: kache
+        type: string
+      targets:
+        description: "JSON array of Rust target triples to build"
+        required: false
+        type: string
+        default: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-pc-windows-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"]'
+      runner_linux:
+        description: "Runner label for Linux/Windows cross-compilation jobs"
+        required: false
+        type: string
+        default: "kunobi-runners"
+      runner_macos:
+        description: 'Runner labels for macOS native builds (JSON array, e.g. ["self-hosted", "macOS", "ARM64"])'
+        required: false
+        type: string
+        default: '["self-hosted", "macOS", "ARM64"]'
+      runner_windows:
+        description: 'Optional runner for NATIVE Windows builds (JSON array or label). When set, `*-windows-*` targets build natively on it. When empty (default) Windows targets cross-compile on the Linux runner: `-pc-windows-msvc` via cargo-xwin (real MSVC ABI), `-pc-windows-gnu` via `cross`. Leaving it empty is usually preferred — no self-hosted Windows runner needed.'
+        required: false
+        type: string
+        default: ""
+      rust_toolchain:
+        description: "Rust toolchain to use"
+        required: false
+        type: string
+        default: "stable"
+      build_args:
+        description: "Extra arguments passed to cargo/cross build (e.g., --features foo)"
+        required: false
+        type: string
+        default: ""
+      strip_binaries:
+        description: "Strip debug symbols from binaries"
+        required: false
+        type: boolean
+        default: true
+      release_draft:
+        # Assets are always uploaded to a draft first (required for immutable
+        # releases); this flag controls whether the draft is left unpublished
+        # for manual review (true) or automatically published (false).
+        description: "Leave the GitHub Release as an unpublished draft (skip the auto-publish step)"
+        required: false
+        type: boolean
+        default: false
+      extra_build_env:
+        description: "Extra environment variables for build (one KEY=value per line)"
+        required: false
+        type: string
+        default: ""
+      checkout_submodules:
+        description: "Checkout submodules"
+        required: false
+        type: boolean
+        default: false
+      github_app_auth:
+        description: "Use GitHub App Token for checkout"
+        required: false
+        type: boolean
+        default: false
+      github_app_repos:
+        description: "Additional repositories to access (one per line)"
+        required: false
+        type: string
+        default: ""
+      # --- Debian packaging (opt-in; default off → no change for existing callers) ---
+      build_deb:
+        description: "Build a Debian .deb package for Linux targets via cargo-deb (opt-in; default off). Requires the consumer Cargo.toml to define [package.metadata.deb] with depends = \"\" for static-musl binaries."
+        required: false
+        type: boolean
+        default: false
+      deb_package:
+        description: "Cargo package selector (`-p`) for the .deb build. Set this for workspace consumers whose packaged crate is a workspace member (e.g. \"kobe-ctl\"). Empty (default) → no `-p`, packaging the root package as before (e.g. kache)."
+        required: false
+        type: string
+        default: ""
+      upload_windows_exe:
+        description: "Also publish the bare signed .exe per Windows target as a first-class release asset (binary_name-<triple>.exe + .sha256), in addition to the .zip. Opt-in; default off. Lets winget install it as InstallerType: portable."
+        required: false
+        type: boolean
+        default: false
+      # --- Code signing (opt-in; default off → no change for existing callers) ---
+      enable_signing:
+        description: "Enable OS code signing of built binaries"
+        required: false
+        type: boolean
+        default: false
+      notarize_macos:
+        description: "Submit macOS binaries for Apple notarization"
+        required: false
+        type: boolean
+        default: true
+      # NOTE: the CODESIGN_*/PGP_SIGN_* config values are declared under `secrets:`
+      # below (not here). Callers in public repos store them as secrets, and the
+      # `secrets` context cannot be referenced from a reusable-workflow `with:` —
+      # so they must be passed through the `secrets:` block.
+      jsign_sha256:
+        description: "Pinned sha256 of the jsign jar"
+        required: false
+        type: string
+        default: ""
+      rcodesign_sha256:
+        description: "Pinned sha256 of the rcodesign tarball"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      app_id:
+        description: "GitHub App ID"
+        required: false
+      app_pem:
+        description: "GitHub App PEM"
+        required: false
+      # Code-signing secrets. NOTE: no Apple secrets — macOS creds live in GCP
+      # Secret Manager (fetched via the CODESIGN_* identity).
+      pgp_cert_base64:
+        description: "Base64 OpenPGP public cert (Linux)"
+        required: false
+      pgp_signer_token:
+        description: "Token (GitHub App or PAT) with read on private kunobi-ninja/kunobi-pgp-kms"
+        required: false
+      windows_cert_chain:
+        description: "PKCS7 EV certificate chain (Windows Authenticode)"
+        required: false
+      # CODESIGN_*/PGP_SIGN_* config — passed as secrets (callers in public repos
+      # keep these out of Variables; secrets can't ride in a reusable-workflow `with:`).
+      codesign_wif_provider:
+        description: "WIF provider for code signing (Windows Authenticode + Apple Secret Manager)"
+        required: false
+      codesign_gcp_project:
+        description: "GCP project for code signing + Apple Secret Manager"
+        required: false
+      codesign_service_account:
+        description: "Service account to impersonate; empty = direct WIF"
+        required: false
+      codesign_kms_keyring:
+        description: "Authenticode KMS keyring"
+        required: false
+      codesign_kms_key_alias:
+        description: "Authenticode KMS key alias"
+        required: false
+      pgp_sign_wif_provider:
+        description: "WIF provider for OpenPGP KMS (Linux)"
+        required: false
+      pgp_sign_gcp_project_id:
+        description: "GCP project for OpenPGP KMS"
+        required: false
+      pgp_sign_service_account:
+        description: "Service account for OpenPGP KMS"
+        required: false
+      pgp_sign_kms_key_version:
+        description: "OpenPGP KMS key version path"
+        required: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # --- Job 1: Compute build matrix from target list ---
+  setup:
+    name: Setup build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Compute matrix
+        id: matrix
+        shell: bash
+        env:
+          TARGETS: ${{ inputs.targets }}
+          RUNNER_LINUX: ${{ inputs.runner_linux }}
+          RUNNER_MACOS: ${{ inputs.runner_macos }}
+          RUNNER_WINDOWS: ${{ inputs.runner_windows }}
+        run: |
+          # Parse runner inputs: macos/windows may be a JSON array, linux a plain string.
+          MACOS_RUNNER=$(echo "$RUNNER_MACOS" | jq -c '.' 2>/dev/null || echo "\"$RUNNER_MACOS\"")
+          LINUX_RUNNER=$(echo "$RUNNER_LINUX" | jq -c '.' 2>/dev/null || echo "\"$RUNNER_LINUX\"")
+          # `runner_windows` is empty by default (→ cross-compile Windows on Linux:
+          # msvc via cargo-xwin, gnu via `cross`). When set, Windows targets build
+          # NATIVELY on it instead. Empty string → JSON "".
+          WINDOWS_RUNNER=$(echo "${RUNNER_WINDOWS:-}" | jq -c '.' 2>/dev/null || echo "\"${RUNNER_WINDOWS:-}\"")
+          [ -n "$WINDOWS_RUNNER" ] || WINDOWS_RUNNER='""'
+
+          # For each target, compute: runner, build method, archive_ext, binary_ext.
+          # A Windows target builds natively iff runner_windows is set; otherwise
+          # it cross-compiles on the Linux runner. Two cross methods on Linux:
+          #   - `-pc-windows-msvc` → cargo-xwin (real MSVC ABI; clang + the MS CRT
+          #     and Windows SDK downloaded by `xwin`). use_xwin=true.
+          #   - `-pc-windows-gnu`  → `cross` (Docker / MinGW). use_cross=true.
+          # Native (runner_windows set) uses plain `cargo` on the Windows host.
+          MATRIX=$(echo "$TARGETS" | jq -c \
+            --argjson rl "$LINUX_RUNNER" --argjson rm "$MACOS_RUNNER" --argjson rw "$WINDOWS_RUNNER" '
+            [.[]
+              | (test("windows")) as $win
+              | (test("windows-msvc")) as $msvc
+              | ($win and ($rw != "")) as $win_native
+              | {
+              target: .,
+              runner: (if test("apple-darwin") then $rm elif $win_native then $rw else $rl end),
+              # msvc Windows that is NOT building natively → cargo-xwin on Linux.
+              use_xwin: ($msvc and ($win_native | not)),
+              # Linux targets, and gnu-Windows that is not native → `cross`.
+              use_cross: ((test("linux") or ($win and ($msvc | not))) and ($win_native | not)),
+              archive_ext: (if $win then "zip" else "tar.gz" end),
+              binary_ext: (if $win then ".exe" else "" end)
+            }]')
+          echo "matrix={\"include\":$MATRIX}" >> $GITHUB_OUTPUT
+          echo "Matrix: $MATRIX"
+
+  # --- Job 2: Build each target ---
+  build:
+    name: Build ${{ matrix.target }}
+    needs: setup
+    runs-on: ${{ matrix.runner }}
+    # Cap a single target's build so a hang (e.g. a stalled cargo-xwin CRT/SDK
+    # download) fails fast instead of running to GitHub's 6h default.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Configure isolated Rust + git homes
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "RUSTUP_INIT_SKIP_PATH_CHECK=yes" >> "$GITHUB_ENV"
+          # Per-job global git config to avoid concurrent-job lock
+          # contention on shared self-hosted runners. On macOS
+          # specifically, two matrix entries (e.g. x86_64 and
+          # aarch64 darwin builds) land on the same physical runner
+          # and both call `git config --global --add safe.directory`
+          # via actions/checkout. They race on `~/.gitconfig.lock`,
+          # both fail through the action's 3-attempt retry loop
+          # (~6-9s window), and the whole job exits with code 1
+          # before either build runs. Setting GIT_CONFIG_GLOBAL to
+          # a per-job temp file gives each matrix entry its own
+          # global-config namespace — no shared file, no lock race.
+          # Honored since git 2.32 (released 2021-06).
+          mkdir -p "$RUNNER_TEMP"
+          : > "$RUNNER_TEMP/gitconfig"
+          echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig" >> "$GITHUB_ENV"
+
+      - name: Checkout with GitHub App
+        uses: zondax/actions/checkout-with-app@v1
+        with:
+          github_app_auth: ${{ inputs.github_app_auth }}
+          github_app_repos: ${{ inputs.github_app_repos }}
+          checkout_submodules: ${{ inputs.checkout_submodules }}
+          app_id: ${{ secrets.app_id }}
+          app_pem: ${{ secrets.app_pem }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Install target for active Rust toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # cargo-xwin cross-compiles `-pc-windows-msvc` from Linux: it links with
+      # lld-link against the MSVC CRT + Windows SDK that `xwin` downloads, using
+      # clang/clang-cl as the C/C++ compiler. nasm + cmake are needed by native
+      # deps (aws-lc-sys, ring) whose build scripts assemble/cmake C for the
+      # target. `zip` is needed by the Package step (Windows artifacts are .zip,
+      # and the Linux host has no `zip` by default). Runs on the Linux build host
+      # (only reached when use_xwin=true).
+      #
+      # clang/lld come from apt.llvm.org, NOT the distro: Ubuntu's default clang-18
+      # mis-compiles two bundled C deps when cross-targeting Windows-msvc — x86_64
+      # leaves zstd-sys's SSE2 intrinsics (`_mm_*`) as undefined symbols at link,
+      # and aarch64 rejects the MSVC `<intrin.h>` ("conflicting types for
+      # '__prefetch'", pulled in by zstd-sys + libsqlite3-sys). A modern clang
+      # fixes both (verified: clang-22 builds both targets cleanly, clang-18 fails
+      # both). Bump LLVM_VERSION here to roll the toolchain forward.
+      - name: Install xwin toolchain (Windows-msvc cross)
+        if: matrix.use_xwin
+        env:
+          LLVM_VERSION: "21"
+        run: |
+          sudo apt-get update
+          # build-essential = the HOST toolchain: build scripts and proc-macros
+          # link with `cc` (gcc) on the Linux runner, independently of the Windows
+          # cross compiler. The distro `clang` install used to drag gcc in
+          # transitively; pulling clang from apt.llvm.org no longer does, and the
+          # self-hosted runner has no gcc preinstalled — so install it explicitly
+          # or host build scripts fail with `linker 'cc' not found`.
+          sudo apt-get install -y --no-install-recommends build-essential curl nasm cmake zip
+          # Modern clang/lld from apt.llvm.org (distro clang-18 is too old — see above).
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$LLVM_VERSION"
+          sudo apt-get install -y --no-install-recommends \
+            "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION"
+          # cargo-xwin and the ring `.S` shim invoke unversioned tool names via PATH;
+          # point them at the freshly installed toolchain.
+          for t in clang clang++ clang-cl lld-link llvm-lib llvm-rc llvm-ar llvm-ranlib llvm-nm llvm-dlltool; do
+            sudo ln -sf "/usr/lib/llvm-$LLVM_VERSION/bin/$t" "/usr/local/bin/$t"
+          done
+      - name: Install cargo-xwin
+        if: matrix.use_xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      # cargo-xwin compiles C/C++ with clang-cl, but cc-rs falls back to the GNU
+      # `clang` driver to assemble crates that ship GNU `.S` files (e.g. ring's
+      # aarch64 asm). That fallback inherits clang-cl's `/imsvc` MSVC-include
+      # flags, which the GNU driver rejects ("unknown argument" / treats `/imsvc`
+      # as a missing file) — so the build dies, or 44min-hangs were really
+      # masking it. Shim `clang` (the bare name cc-rs invokes via PATH) to
+      # rewrite each `/imsvc` token to `-isystem` (the GNU spelling) and exec the
+      # real clang. Transparent otherwise; clang-cl (used for C) is NOT shadowed,
+      # so NEON codegen for zstd/blake3 etc. stays correct. Needed for
+      # aarch64-pc-windows-msvc; harmless for x86_64 (no clang `.S` step there).
+      - name: Shim clang for ring .S asm under cargo-xwin
+        if: matrix.use_xwin
+        run: |
+          SHIM_DIR="$RUNNER_TEMP/xwin-clang-shim"
+          mkdir -p "$SHIM_DIR"
+          cat > "$SHIM_DIR/clang" <<'SHIM'
+          #!/bin/sh
+          # Resolve the real clang: first `clang` on PATH that isn't this shim.
+          self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          real=""
+          IFS=:
+          for d in $PATH; do
+            [ "$d" = "$self_dir" ] && continue
+            if [ -x "$d/clang" ]; then real="$d/clang"; break; fi
+          done
+          unset IFS
+          [ -n "$real" ] || { echo "xwin-clang-shim: real clang not found on PATH" >&2; exit 127; }
+          # Rebuild argv, translating clang-cl's `/imsvc` -> GNU `-isystem`.
+          n=0
+          for a in "$@"; do
+            [ "$a" = "/imsvc" ] && a="-isystem"
+            eval "arg_$n=\$a"; n=$((n+1))
+          done
+          i=0; set --
+          while [ "$i" -lt "$n" ]; do eval "v=\$arg_$i"; set -- "$@" "$v"; i=$((i+1)); done
+          exec "$real" "$@"
+          SHIM
+          chmod +x "$SHIM_DIR/clang"
+          echo "$SHIM_DIR" >> "$GITHUB_PATH"
+
+      - name: Set extra environment
+        if: inputs.extra_build_env != ''
+        env:
+          EXTRA_BUILD_ENV: ${{ inputs.extra_build_env }}
+        run: |
+          echo "$EXTRA_BUILD_ENV" | while IFS= read -r line; do
+            if [[ -n "$line" && "$line" != \#* ]]; then
+              echo "$line" >> $GITHUB_ENV
+            fi
+          done
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+          CROSS_REMOTE: ${{ matrix.use_cross && '1' || '' }}
+        run: |
+          BUILD_CMD="cargo build"
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            BUILD_CMD="cross build"
+          elif [ "${{ matrix.use_xwin }}" = "true" ]; then
+            BUILD_CMD="cargo xwin build"
+          fi
+          $BUILD_CMD --release --target "$TARGET" $BUILD_ARGS
+
+      - name: Strip binary
+        if: inputs.strip_binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_NAME: ${{ inputs.binary_name }}${{ matrix.binary_ext }}
+        run: |
+          BIN="target/$TARGET/release/$BINARY_NAME"
+          if [[ "$TARGET" == *"windows"* ]]; then
+            echo "Skipping strip for Windows"
+          elif [ "${{ matrix.use_cross }}" = "true" ]; then
+            docker run --rm -v "$(pwd):/workspace" -w /workspace \
+              "ghcr.io/cross-rs/$TARGET:main" \
+              sh -c "strip $BIN 2>/dev/null || true"
+          else
+            strip "$BIN"
+          fi
+
+      # --- Code signing: all platforms sign the BINARY before packaging.
+      #     macOS/Windows embed the signature in the binary; Linux produces a
+      #     detached .asc that gets bundled into the archive next to the binary. ---
+      - name: Sign macOS binary
+        if: inputs.enable_signing && contains(matrix.target, 'apple-darwin')
+        uses: zondax/actions/sign-macos-binary@v1
+        with:
+          binary-path: target/${{ matrix.target }}/release/${{ inputs.binary_name }}
+          workload-identity-provider: ${{ secrets.codesign_wif_provider }}
+          gcp-project: ${{ secrets.codesign_gcp_project }}
+          service-account: ${{ secrets.codesign_service_account }}
+          notarize: ${{ inputs.notarize_macos }}
+          rcodesign-sha256: ${{ inputs.rcodesign_sha256 }}
+
+      - name: Authenticate with GCP (Authenticode)
+        id: auth-codesign
+        if: inputs.enable_signing && contains(matrix.target, 'windows')
+        uses: zondax/actions/gcp-wif-auth@v1
+        with:
+          workload_identity_provider: ${{ secrets.codesign_wif_provider }}
+          project_id: ${{ secrets.codesign_gcp_project }}
+          service_account: ${{ secrets.codesign_service_account }}
+          token_format: access_token
+          create_credentials_file: 'false'
+          setup_gcloud: 'false'
+          verify_authentication: 'false'
+
+      - name: Sign Windows binary
+        if: inputs.enable_signing && contains(matrix.target, 'windows')
+        uses: zondax/actions/sign-windows-binary@v1
+        with:
+          binary-path: target/${{ matrix.target }}/release/${{ inputs.binary_name }}.exe
+          gcp-access-token: ${{ steps.auth-codesign.outputs.access_token }}
+          kms-keyring: ${{ secrets.codesign_kms_keyring }}
+          kms-key-alias: ${{ secrets.codesign_kms_key_alias }}
+          cert-chain: ${{ secrets.windows_cert_chain }}
+          jsign-sha256: ${{ inputs.jsign_sha256 }}
+
+      - name: Sign Linux binary
+        if: inputs.enable_signing && contains(matrix.target, 'linux')
+        uses: zondax/actions/sign-linux-binary@v1
+        with:
+          target-path: target/${{ matrix.target }}/release/${{ inputs.binary_name }}
+          workload-identity-provider: ${{ secrets.pgp_sign_wif_provider }}
+          gcp-project-id: ${{ secrets.pgp_sign_gcp_project_id }}
+          service-account: ${{ secrets.pgp_sign_service_account }}
+          signer-token: ${{ secrets.pgp_signer_token }}
+          kms-key: ${{ secrets.pgp_sign_kms_key_version }}
+          cert-base64: ${{ secrets.pgp_cert_base64 }}
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_NAME: ${{ inputs.binary_name }}
+          BINARY_EXT: ${{ matrix.binary_ext }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          ARCHIVE="${BINARY_NAME}-${TARGET}.${ARCHIVE_EXT}"
+          if [[ "$ARCHIVE_EXT" == "zip" ]]; then
+            BIN_PATH="target/$TARGET/release/${BINARY_NAME}${BINARY_EXT}"
+            if [ "${RUNNER_OS:-}" = "Windows" ]; then
+              # Native Windows runner: Git-bash has no `zip`; use PowerShell.
+              powershell -NoProfile -Command \
+                "Compress-Archive -Path '$BIN_PATH' -DestinationPath '$ARCHIVE' -Force"
+            else
+              # Linux (cross-compiled Windows or otherwise): `zip` is present.
+              (cd "target/$TARGET/release" && zip "$OLDPWD/$ARCHIVE" "${BINARY_NAME}${BINARY_EXT}")
+            fi
+          else
+            # Bundle the detached .asc (Linux binary signing) into the tarball
+            # next to the binary, so the signature travels with what it signs.
+            ASC="${BINARY_NAME}${BINARY_EXT}.asc"
+            if [ -f "target/$TARGET/release/$ASC" ]; then
+              tar czf "$ARCHIVE" -C "target/$TARGET/release" "${BINARY_NAME}${BINARY_EXT}" "$ASC"
+            else
+              tar czf "$ARCHIVE" -C "target/$TARGET/release" "${BINARY_NAME}${BINARY_EXT}"
+            fi
+          fi
+
+      # Linux ALSO signs the packaged archive (detached .asc, top-level release
+      # asset) — in addition to the binary's .asc bundled inside it. Two PGP sigs:
+      # one over the ELF (inside the tarball), one over the .tar.gz (download).
+      - name: Sign Linux archive
+        if: inputs.enable_signing && contains(matrix.target, 'linux')
+        uses: zondax/actions/sign-linux-binary@v1
+        with:
+          target-path: ${{ inputs.binary_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+          workload-identity-provider: ${{ secrets.pgp_sign_wif_provider }}
+          gcp-project-id: ${{ secrets.pgp_sign_gcp_project_id }}
+          service-account: ${{ secrets.pgp_sign_service_account }}
+          signer-token: ${{ secrets.pgp_signer_token }}
+          kms-key: ${{ secrets.pgp_sign_kms_key_version }}
+          cert-base64: ${{ secrets.pgp_cert_base64 }}
+
+      - name: Checksum
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_NAME: ${{ inputs.binary_name }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          ARCHIVE="${BINARY_NAME}-${TARGET}.${ARCHIVE_EXT}"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          elif command -v shasum &>/dev/null; then
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          else
+            # Native Windows fallback if neither coreutils tool is on PATH.
+            powershell -NoProfile -Command \
+              "\$h=(Get-FileHash -Algorithm SHA256 '$ARCHIVE').Hash.ToLower(); Write-Output \"\$h  $ARCHIVE\"" \
+              > "${ARCHIVE}.sha256"
+          fi
+
+      # --- Bare Windows .exe (opt-in; Windows targets only). Publishes the
+      #     Authenticode-signed .exe as its own first-class release asset named
+      #     <binary_name>-<triple>.exe (+ .sha256), so winget can install it as
+      #     InstallerType: portable (no zip-nesting, sidesteps the nested-portable
+      #     upgrade/uninstall hang). The .zip is still produced above
+      #     (cargo-binstall consumes it); this is the SAME signed binary.
+      - name: Publish bare Windows .exe
+        if: inputs.upload_windows_exe && contains(matrix.target, 'windows')
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_NAME: ${{ inputs.binary_name }}
+        run: |
+          SRC="target/$TARGET/release/${BINARY_NAME}.exe"
+          OUT="${BINARY_NAME}-${TARGET}.exe"
+          cp "$SRC" "$OUT"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "$OUT" > "${OUT}.sha256"
+          elif command -v shasum &>/dev/null; then
+            shasum -a 256 "$OUT" > "${OUT}.sha256"
+          else
+            powershell -NoProfile -Command \
+              "\$h=(Get-FileHash -Algorithm SHA256 '$OUT').Hash.ToLower(); Write-Output \"\$h  $OUT\"" \
+              > "${OUT}.sha256"
+          fi
+
+      # --- Debian package (opt-in; Linux targets only). Builds a .deb from the
+      #     ALREADY-built binary (--no-build → no recompile), packaged AFTER the
+      #     strip + binary-signing steps above so the .deb carries the stripped,
+      #     signed ELF. The .deb is then PGP-signed (detached .asc) and checksummed
+      #     exactly like the tar.gz assets, and uploaded as a top-level release
+      #     asset named <binary_name>_<version>_<arch>.deb (e.g. kache_… or kobe_…).
+      #
+      # NOTE: the CONSUMING repo must define `[package.metadata.deb]` in its
+      # Cargo.toml with `depends = ""` (the static-musl binary has no shared-lib
+      # deps) — otherwise `cargo deb` runs dpkg-shlibdeps and fails. We do NOT add
+      # any Cargo metadata here; that belongs to the consumer's repo.
+      - name: Install cargo-deb
+        if: inputs.build_deb && contains(matrix.target, 'linux')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build Debian package
+        id: deb
+        if: inputs.build_deb && contains(matrix.target, 'linux')
+        env:
+          # Falls back to kache (also the input default) so an unset/empty
+          # binary_name reproduces the original hardcoded `kache_…deb` name.
+          BINARY_NAME: ${{ inputs.binary_name || 'kache' }}
+          DEB_PACKAGE: ${{ inputs.deb_package }}
+          TARGET: ${{ matrix.target }}
+          # Derive <version> from the release tag the same git ref the release job
+          # uploads under (github.ref_name), dropping a leading "v": v1.2.3 → 1.2.3.
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          # Map the Rust musl triple to the Debian arch used in the asset name.
+          case "$TARGET" in
+            x86_64-unknown-linux-musl)  ARCH="amd64" ;;
+            aarch64-unknown-linux-musl) ARCH="arm64" ;;
+            *) echo "Unsupported Linux target for .deb: $TARGET" >&2; exit 1 ;;
+          esac
+          DEB="${BINARY_NAME}_${VERSION}_${ARCH}.deb"
+          # --no-build → package the binary already built/stripped/signed above.
+          # `-p $DEB_PACKAGE` only when set (workspace member); empty → root package.
+          cargo deb --no-build ${DEB_PACKAGE:+-p "$DEB_PACKAGE"} --target "$TARGET" --output "$DEB"
+          echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+
+      - name: Sign Debian package
+        if: inputs.build_deb && contains(matrix.target, 'linux')
+        uses: zondax/actions/sign-linux-binary@v1
+        with:
+          target-path: ${{ steps.deb.outputs.deb }}
+          workload-identity-provider: ${{ secrets.pgp_sign_wif_provider }}
+          gcp-project-id: ${{ secrets.pgp_sign_gcp_project_id }}
+          service-account: ${{ secrets.pgp_sign_service_account }}
+          signer-token: ${{ secrets.pgp_signer_token }}
+          kms-key: ${{ secrets.pgp_sign_kms_key_version }}
+          cert-base64: ${{ secrets.pgp_cert_base64 }}
+
+      - name: Checksum Debian package
+        if: inputs.build_deb && contains(matrix.target, 'linux')
+        env:
+          DEB: ${{ steps.deb.outputs.deb }}
+        run: |
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "$DEB" > "${DEB}.sha256"
+          else
+            shasum -a 256 "$DEB" > "${DEB}.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.binary_name }}-${{ matrix.target }}
+          retention-days: 1
+          # The .deb / bare-.exe paths are no-ops on non-matching targets or when
+          # their opt-in is off (upload-artifact tolerates missing paths).
+          path: |
+            ${{ inputs.binary_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+            ${{ inputs.binary_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
+            ${{ inputs.binary_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}.asc
+            ${{ inputs.binary_name }}-${{ matrix.target }}.exe
+            ${{ inputs.binary_name }}-${{ matrix.target }}.exe.sha256
+            *.deb
+            *.deb.sha256
+            *.deb.asc
+
+  # --- Job 3: Create/upload GitHub Release ---
+  release:
+    name: Upload release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with GitHub App
+        uses: zondax/actions/checkout-with-app@v1
+        with:
+          github_app_auth: ${{ inputs.github_app_auth }}
+          github_app_repos: ${{ inputs.github_app_repos }}
+          checkout_submodules: ${{ inputs.checkout_submodules }}
+          app_id: ${{ secrets.app_id }}
+          app_pem: ${{ secrets.app_pem }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create or upload to release
+        env:
+          # Publish with the caller's release PAT when provided, falling back to
+          # GITHUB_TOKEN. This is REQUIRED for the draft→publish flow to fire a
+          # *cascading* `release: published` event: GitHub suppresses workflow
+          # triggers for events produced by GITHUB_TOKEN, so a draft published by
+          # the bot is "sterile" — downstream release-triggered workflows (crates
+          # publish, package publish, etc.) never run. A PAT (or App token) makes
+          # the publish transition cascade. Direct create-publish happened to
+          # cascade before the draft→publish change; the draft-edit transition
+          # does not, so this token is now load-bearing.
+          GH_TOKEN: ${{ secrets.pgp_signer_token || github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          # Always create the release as a DRAFT first, attach every asset, and
+          # only THEN publish it. This ordering is mandatory for GitHub's
+          # immutable releases: once a release is published its assets can't be
+          # added, modified, or deleted, so all assets must be in place before
+          # the publish transition. It is also strictly backward-compatible for
+          # repos without immutability enabled — the final state is an identical
+          # published release with all assets attached.
+          if ! gh release view "$TAG_NAME" &>/dev/null; then
+            # Tags carrying a known pre-release identifier (rc, alpha,
+            # beta, pre/preview, dev) are published as pre-releases,
+            # with "Latest" left pinned to the most recent stable tag
+            # — otherwise an RC silently becomes the release that
+            # `@latest` installers and the release badge resolve to.
+            # Set the pre-release/latest attributes at create time; they persist
+            # through the publish transition below.
+            PRERELEASE_FLAG=""
+            case "$TAG_NAME" in
+              *-rc*|*-alpha*|*-beta*|*-pre*|*-dev*)
+                PRERELEASE_FLAG="--prerelease --latest=false" ;;
+            esac
+            gh release create "$TAG_NAME" --draft $PRERELEASE_FLAG --generate-notes
+          fi
+          # Attach all assets to the (still draft) release (--clobber overwrites
+          # existing on re-runs).
+          gh release upload "$TAG_NAME" artifacts/* --clobber
+          # Publish the draft — this transition fires the `release: published`
+          # event and, when immutable releases are enabled, locks the tag and
+          # assets. Skip it when the caller opted into a draft for manual review.
+          if [ "${{ inputs.release_draft }}" != "true" ]; then
+            gh release edit "$TAG_NAME" --draft=false
+          fi
