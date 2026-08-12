@@ -1,0 +1,27 @@
+# Throwaway probe: proves that a job DEFINED in this in-org reusable workflow
+# is authorized onto the `signing-runners` group when this file's SHA is on the
+# group's selected_workflows allowlist.
+#
+# It exists because the real path can otherwise only be tested by cutting a
+# release tag, and releases publish to crates.io irreversibly. Delete once the
+# mechanism is confirmed.
+name: Probe macOS signing runners
+on:
+  workflow_call:
+    inputs:
+      runner_macos:
+        required: false
+        type: string
+        default: '["self-hosted", "macOS", "ARM64"]'
+
+jobs:
+  probe:
+    runs-on: ${{ fromJSON(inputs.runner_macos) }}
+    timeout-minutes: 5
+    steps:
+      - name: Report the runner that claimed this job
+        run: |
+          echo "runner name : ${RUNNER_NAME:-unknown}"
+          echo "runner os   : ${RUNNER_OS:-unknown}"
+          echo "arch        : $(uname -m)"
+          echo "PROBE OK — an in-org reusable workflow reached the signing runners"
