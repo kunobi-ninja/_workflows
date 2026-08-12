@@ -67,10 +67,22 @@ gh api --method PATCH orgs/kunobi-ninja/actions/runner-groups/3 \
 Note the API replaces the whole list, so always pass every entry you intend to
 keep. Wildcards are rejected — the ref must resolve to a real branch, tag or SHA.
 
-**3. Verify with a real tag.** Branch-triggered CI proves nothing here: no job on
-`main` requests the `mac-mini` label, so only a release tag exercises the
-signing-runner path. Cut a throwaway `-rc` tag after any change to the pin or the
-allowlist.
+**3. Verify with the probe, not a release tag.** Ordinary CI proves nothing here:
+no job on `main` requests the self-hosted macOS runners, so only the release path
+exercises them. But a `-rc` tag is *not* a cheap test — it publishes to crates.io,
+and crates.io versions are permanent. Use `_probe-macos.yml` instead:
+
+1. Add the probe to the allowlist at its current SHA (keep every other entry —
+   the API replaces the whole list).
+2. In `kache`, push a branch `probe/**` containing a workflow triggered on
+   `push: branches: ['probe/**']` whose only job is
+   `uses: kunobi-ninja/_workflows/.github/workflows/_probe-macos.yml@<sha>`.
+3. A green run means a job defined in this repo was authorized onto the group.
+   A run that sits queued against idle runners means it was not.
+4. Delete the branch and drop the probe entry from the allowlist.
+
+Confirmed working this way on 2026-08-12: claimed by `mac-runner-2` in
+`signing-runners` with `restricted_to_workflows: true`.
 
 ## Step-level actions are unaffected
 
