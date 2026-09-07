@@ -66,16 +66,30 @@ names that same SHA. Bumping one without the other **breaks releases silently** 
 the Darwin jobs queue forever with no error. Treat the pin bump and the allowlist
 update as one change:
 
+The API **replaces** the whole list, so never write the entries from memory or
+from this file — read the live list first and send it back with only the SHA
+changed:
+
 ```bash
+# what is actually there right now
+gh api orgs/kunobi-ninja/actions/runner-groups/3 -q '.selected_workflows[]'
+
 # after merging a change here, for the new SHA:
 gh api --method PATCH orgs/kunobi-ninja/actions/runner-groups/3 \
   -f 'selected_workflows[]=kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@<new-sha>' \
   -f 'selected_workflows[]=kunobi-ninja/kache/.github/workflows/bench.yml@refs/heads/main' \
-  -f 'selected_workflows[]=kunobi-ninja/kache/.github/workflows/ci.yml@refs/heads/main'
+  -f 'selected_workflows[]=kunobi-ninja/kache/.github/workflows/ci.yml@refs/heads/main' \
+  -f 'selected_workflows[]=kunobi-ninja/kobe/.github/workflows/ci.yml@refs/heads/main'
 ```
 
-Note the API replaces the whole list, so always pass every entry you intend to
-keep. Wildcards are rejected — the ref must resolve to a real branch, tag or SHA.
+Wildcards are rejected — the ref must resolve to a real branch, tag or SHA.
+
+This example previously listed three entries and omitted
+`kunobi-ninja/kobe/.github/workflows/ci.yml`. Because the PATCH replaces the
+list, running it verbatim would have dropped kobe's own access to the group —
+the same silent failure this repo exists to prevent, introduced by the
+instructions for preventing it. The list above matched the live group on
+2026-09-07; check it anyway.
 
 **3. Verify with the probe, not a release tag.** Ordinary CI proves nothing here:
 no job on `main` requests the self-hosted macOS runners, so only the release path
