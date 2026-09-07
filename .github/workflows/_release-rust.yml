@@ -640,10 +640,22 @@ jobs:
           app_id: ${{ secrets.app_id }}
           app_pem: ${{ secrets.app_pem }}
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v7
+      - name: Download the build artifacts
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
+          # This job's own build artifacts, not everything the run produced.
+          # The build matrix uploads `<binary_name>-<target>` and nothing else,
+          # so that prefix is the whole asset set.
+          #
+          # Unscoped, a caller whose release run also publishes diagnostics —
+          # kind logs, coverage, profiles — has them swept in here. Those
+          # unpack into directories, `gh release upload` cannot post a
+          # directory, and the step dies with the release still drafted and its
+          # binaries unattached. kobe hit this on v0.43.0: a flaky conformance
+          # leg uploaded kind logs, and six built targets never reached the
+          # release page.
+          pattern: ${{ inputs.binary_name }}-*
           merge-multiple: true
 
       - name: List artifacts
@@ -687,7 +699,16 @@ jobs:
           fi
           # Attach all assets to the (still draft) release (--clobber overwrites
           # existing on re-runs).
-          gh release upload "$TAG_NAME" artifacts/* --clobber
+          # Only regular files are assets. The pattern above should already
+          # exclude directories, but one unexpected entry must not be able to
+          # abort the upload and strand a drafted release again.
+          mapfile -t ASSETS < <(find artifacts -maxdepth 1 -type f | sort)
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "no release assets found under artifacts/ -- refusing to publish an empty release" >&2
+            exit 1
+          fi
+          printf 'attaching %s\n' "${ASSETS[@]}"
+          gh release upload "$TAG_NAME" "${ASSETS[@]}" --clobber
           # Publish the draft — this transition fires the `release: published`
           # event and, when immutable releases are enabled, locks the tag and
           # assets. Skip it when the caller opted into a draft for manual review.
