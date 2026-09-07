@@ -36,11 +36,21 @@ name them and `restricted_to_workflows` can stay enabled.
 
 | Workflow | Mirrored from |
 | --- | --- |
-| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@7f61511b59d2b86454e65a6bbf48f14469692324` (tag `v11`) |
+| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@08a71c76eb0ad6011021486816bd65c7e95d9511` |
 
-The initial import is byte-identical to its source. `kache` pinned that SHA and
-`kobe` pinned tag `v11`; both resolved to the same content, so this mirror
-serves both with no behaviour change.
+Byte-identical to its source, as every re-sync should leave it. Verify with:
+
+```bash
+diff <(gh api "repos/Zondax/_workflows/contents/.github/workflows/_release-rust.yml?ref=<upstream-sha>" -q .content | base64 -d) \
+     .github/workflows/_release-rust.yml
+```
+
+Re-sync history:
+
+| Date | Upstream | Why |
+| --- | --- | --- |
+| 2026-08-12 | `7f61511` (tag `v11`) | initial import |
+| 2026-09-07 | `08a71c7` | `download-artifact@v7`→`@v8`, and Zondax/_workflows#132: the release job downloaded every artifact in the run, so one directory-shaped artifact aborted the upload and left kobe v0.43.0 drafted with no binaries |
 
 ## Maintenance contract
 
