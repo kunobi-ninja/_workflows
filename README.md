@@ -36,7 +36,7 @@ name them and `restricted_to_workflows` can stay enabled.
 
 | Workflow | Mirrored from |
 | --- | --- |
-| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@08a71c76eb0ad6011021486816bd65c7e95d9511` |
+| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@451103fbdc9c0672aa13fc53a71230e64f6b5c8a` |
 
 Byte-identical to its source, as every re-sync should leave it. Verify with:
 
@@ -51,6 +51,12 @@ Re-sync history:
 | --- | --- | --- |
 | 2026-08-12 | `7f61511` (tag `v11`) | initial import |
 | 2026-09-07 | `08a71c7` | `download-artifact@v7`→`@v8`, and Zondax/_workflows#132: the release job downloaded every artifact in the run, so one directory-shaped artifact aborted the upload and left kobe v0.43.0 drafted with no binaries |
+| 2026-09-19 | `451103f` | opt-in Windows CRT/SDK cache with default-branch seeding and content verification |
+
+The `cache_windows_sysroot` input enables the versioned Microsoft CRT/SDK cache.
+Consumers must seed it on their default branch through the upstream
+`_warm-windows-sysroot.yml` workflow before enabling it. The release workflow and
+warmer use the same pinned action.
 
 ## Maintenance contract
 
