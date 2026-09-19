@@ -51,7 +51,6 @@ Re-sync history:
 | --- | --- | --- |
 | 2026-08-12 | `7f61511` (tag `v11`) | initial import |
 | 2026-09-07 | `08a71c7` | `download-artifact@v7`→`@v8`, and Zondax/_workflows#132: the release job downloaded every artifact in the run, so one directory-shaped artifact aborted the upload and left kobe v0.43.0 drafted with no binaries |
-
 | 2026-09-19 | `451103f` | opt-in Windows CRT/SDK cache with default-branch seeding and content verification |
 
 The `cache_windows_sysroot` input enables the versioned Microsoft CRT/SDK cache.
