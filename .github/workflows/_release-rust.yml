@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: ""
+      cache_windows_sysroot:
+        description: "Restore the pinned MSVC CRT/SDK cache seeded by _warm-windows-sysroot.yml on the caller's default branch."
+        required: false
+        type: boolean
+        default: false
       rust_toolchain:
         description: "Rust toolchain to use"
         required: false
@@ -318,7 +323,7 @@ jobs:
             sudo ln -sf "/usr/lib/llvm-$LLVM_VERSION/bin/$t" "/usr/local/bin/$t"
           done
       - name: Install cargo-xwin
-        if: matrix.use_xwin
+        if: matrix.use_xwin && !inputs.cache_windows_sysroot
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-xwin
@@ -373,6 +378,10 @@ jobs:
               echo "$line" >> $GITHUB_ENV
             fi
           done
+
+      - name: Prepare cached Windows sysroot
+        if: matrix.use_xwin && inputs.cache_windows_sysroot
+        uses: Zondax/_workflows/.github/actions/windows-sysroot@c8cbba84fac31aabd59bf238e38bf5e83ec8891b
 
       - name: Build
         env:
