@@ -383,6 +383,31 @@ jobs:
         if: matrix.use_xwin && inputs.cache_windows_sysroot
         uses: Zondax/_workflows/.github/actions/windows-sysroot@c8cbba84fac31aabd59bf238e38bf5e83ec8891b
 
+      # lld-link on Linux is case-sensitive. MSVC crates pass Advapi32.lib;
+      # xwin stores advapi32.lib. Alias first-letter uppercase names in the
+      # live sysroot only — do not write them into the verified cache.
+      - name: Alias Windows import libraries for Linux linkers
+        if: matrix.use_xwin && inputs.cache_windows_sysroot
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          root = Path(os.environ["XWIN_CACHE_DIR"]) / "xwin"
+          if not root.is_dir():
+              raise SystemExit(f"missing sysroot: {root}")
+          for path in root.rglob("*.lib"):
+              if path.is_symlink() or not path.is_file():
+                  continue
+              titled = path.name[:1].upper() + path.name[1:]
+              if titled == path.name:
+                  continue
+              dest = path.with_name(titled)
+              if dest.exists():
+                  continue
+              dest.symlink_to(path.name)
+          PY
+
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
