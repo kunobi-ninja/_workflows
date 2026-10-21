@@ -1,0 +1,25 @@
+name: Release binary checks
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/_release-rust.yml
+      - .github/workflows/release-binaries-checks.yml
+      - tests/test_release_binaries.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  archives:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Check archive contents and invalid build configuration
+        run: python -m unittest discover -s tests -p test_release_binaries.py -v
