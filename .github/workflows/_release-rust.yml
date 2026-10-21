@@ -11,6 +11,11 @@ on:
         required: false
         default: kache
         type: string
+      companion_binary:
+        description: "Optional second binary to build, strip, sign and include in each archive. Archive installers are required; incompatible with upload_windows_exe."
+        required: false
+        default: ""
+        type: string
       targets:
         description: "JSON array of Rust target triples to build"
         required: false
@@ -106,6 +111,11 @@ on:
         required: false
         type: boolean
         default: true
+      macos_entitlements:
+        description: "Entitlements plist to sign macOS binaries with, relative to the repository root (empty = none)"
+        required: false
+        type: string
+        default: ""
       # NOTE: the CODESIGN_*/PGP_SIGN_* config values are declared under `secrets:`
       # below (not here). Callers in public repos store them as secrets, and the
       # `secrets` context cannot be referenced from a reusable-workflow `with:` —
@@ -387,6 +397,9 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           BUILD_ARGS: ${{ inputs.build_args }}
+          BINARY_NAME: ${{ inputs.binary_name }}
+          COMPANION_BINARY: ${{ inputs.companion_binary }}
+          UPLOAD_WINDOWS_EXE: ${{ inputs.upload_windows_exe }}
           CROSS_REMOTE: ${{ matrix.use_cross && '1' || '' }}
         run: |
           BUILD_CMD="cargo build"
@@ -395,24 +408,46 @@ jobs:
           elif [ "${{ matrix.use_xwin }}" = "true" ]; then
             BUILD_CMD="cargo xwin build"
           fi
-          $BUILD_CMD --release --target "$TARGET" $BUILD_ARGS
+          BIN_ARGS=()
+          if [ -n "$COMPANION_BINARY" ]; then
+            if [[ ! "$COMPANION_BINARY" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || [ "$COMPANION_BINARY" = "$BINARY_NAME" ]; then
+              echo "companion_binary must name a distinct binary without directories" >&2
+              exit 1
+            fi
+            if [ "$UPLOAD_WINDOWS_EXE" = "true" ]; then
+              echo "A bare Windows executable cannot install a companion; use the ZIP archive" >&2
+              exit 1
+            fi
+            BIN_ARGS=(--bin "$BINARY_NAME" --bin "$COMPANION_BINARY")
+          fi
+          $BUILD_CMD --release --target "$TARGET" $BUILD_ARGS "${BIN_ARGS[@]}"
 
-      - name: Strip binary
+      - name: Strip binaries
         if: inputs.strip_binaries
         env:
           TARGET: ${{ matrix.target }}
-          BINARY_NAME: ${{ inputs.binary_name }}${{ matrix.binary_ext }}
+          BINARY_NAME: ${{ inputs.binary_name }}
+          COMPANION_BINARY: ${{ inputs.companion_binary }}
+          BINARY_EXT: ${{ matrix.binary_ext }}
         run: |
-          BIN="target/$TARGET/release/$BINARY_NAME"
           if [[ "$TARGET" == *"windows"* ]]; then
             echo "Skipping strip for Windows"
-          elif [ "${{ matrix.use_cross }}" = "true" ]; then
-            docker run --rm -v "$(pwd):/workspace" -w /workspace \
-              "ghcr.io/cross-rs/$TARGET:main" \
-              sh -c "strip $BIN 2>/dev/null || true"
-          else
-            strip "$BIN"
+            exit 0
           fi
+          BINARIES=("$BINARY_NAME")
+          if [ -n "$COMPANION_BINARY" ]; then
+            BINARIES+=("$COMPANION_BINARY")
+          fi
+          for name in "${BINARIES[@]}"; do
+            BIN="target/$TARGET/release/${name}${BINARY_EXT}"
+            if [ "${{ matrix.use_cross }}" = "true" ]; then
+              docker run --rm -v "$(pwd):/workspace" -w /workspace \
+                "ghcr.io/cross-rs/$TARGET:main" \
+                sh -c 'strip "$1" 2>/dev/null || true' sh "$BIN"
+            else
+              strip "$BIN"
+            fi
+          done
 
       # --- Code signing: all platforms sign the BINARY before packaging.
       #     macOS/Windows embed the signature in the binary; Linux produces a
@@ -426,6 +461,19 @@ jobs:
           gcp-project: ${{ secrets.codesign_gcp_project }}
           service-account: ${{ secrets.codesign_service_account }}
           notarize: ${{ inputs.notarize_macos }}
+          entitlements: ${{ inputs.macos_entitlements }}
+          rcodesign-sha256: ${{ inputs.rcodesign_sha256 }}
+
+      - name: Sign macOS companion
+        if: inputs.companion_binary != '' && inputs.enable_signing && contains(matrix.target, 'apple-darwin')
+        uses: zondax/actions/sign-macos-binary@v1
+        with:
+          binary-path: target/${{ matrix.target }}/release/${{ inputs.companion_binary }}
+          workload-identity-provider: ${{ secrets.codesign_wif_provider }}
+          gcp-project: ${{ secrets.codesign_gcp_project }}
+          service-account: ${{ secrets.codesign_service_account }}
+          notarize: ${{ inputs.notarize_macos }}
+          entitlements: ${{ inputs.macos_entitlements }}
           rcodesign-sha256: ${{ inputs.rcodesign_sha256 }}
 
       - name: Authenticate with GCP (Authenticode)
@@ -452,6 +500,17 @@ jobs:
           cert-chain: ${{ secrets.windows_cert_chain }}
           jsign-sha256: ${{ inputs.jsign_sha256 }}
 
+      - name: Sign Windows companion
+        if: inputs.companion_binary != '' && inputs.enable_signing && contains(matrix.target, 'windows')
+        uses: zondax/actions/sign-windows-binary@v1
+        with:
+          binary-path: target/${{ matrix.target }}/release/${{ inputs.companion_binary }}.exe
+          gcp-access-token: ${{ steps.auth-codesign.outputs.access_token }}
+          kms-keyring: ${{ secrets.codesign_kms_keyring }}
+          kms-key-alias: ${{ secrets.codesign_kms_key_alias }}
+          cert-chain: ${{ secrets.windows_cert_chain }}
+          jsign-sha256: ${{ inputs.jsign_sha256 }}
+
       - name: Sign Linux binary
         if: inputs.enable_signing && contains(matrix.target, 'linux')
         uses: zondax/actions/sign-linux-binary@v1
@@ -464,33 +523,59 @@ jobs:
           kms-key: ${{ secrets.pgp_sign_kms_key_version }}
           cert-base64: ${{ secrets.pgp_cert_base64 }}
 
+      - name: Sign Linux companion
+        if: inputs.companion_binary != '' && inputs.enable_signing && contains(matrix.target, 'linux')
+        uses: zondax/actions/sign-linux-binary@v1
+        with:
+          target-path: target/${{ matrix.target }}/release/${{ inputs.companion_binary }}
+          workload-identity-provider: ${{ secrets.pgp_sign_wif_provider }}
+          gcp-project-id: ${{ secrets.pgp_sign_gcp_project_id }}
+          service-account: ${{ secrets.pgp_sign_service_account }}
+          signer-token: ${{ secrets.pgp_signer_token }}
+          kms-key: ${{ secrets.pgp_sign_kms_key_version }}
+          cert-base64: ${{ secrets.pgp_cert_base64 }}
+
       - name: Package
         env:
           TARGET: ${{ matrix.target }}
           BINARY_NAME: ${{ inputs.binary_name }}
+          COMPANION_BINARY: ${{ inputs.companion_binary }}
           BINARY_EXT: ${{ matrix.binary_ext }}
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
         run: |
           ARCHIVE="${BINARY_NAME}-${TARGET}.${ARCHIVE_EXT}"
+          FILES=("${BINARY_NAME}${BINARY_EXT}")
+          if [ -n "$COMPANION_BINARY" ]; then
+            FILES+=("${COMPANION_BINARY}${BINARY_EXT}")
+          fi
+          for file in "${FILES[@]}"; do
+            test -f "target/$TARGET/release/$file"
+          done
           if [[ "$ARCHIVE_EXT" == "zip" ]]; then
-            BIN_PATH="target/$TARGET/release/${BINARY_NAME}${BINARY_EXT}"
             if [ "${RUNNER_OS:-}" = "Windows" ]; then
-              # Native Windows runner: Git-bash has no `zip`; use PowerShell.
-              powershell -NoProfile -Command \
-                "Compress-Archive -Path '$BIN_PATH' -DestinationPath '$ARCHIVE' -Force"
+              # Pass paths as data so the native PowerShell command also
+              # handles more than one binary without shell interpolation.
+              export RELEASE_ARCHIVE_FILES RELEASE_BINARY_DIR RELEASE_ARCHIVE_DEST
+              RELEASE_ARCHIVE_FILES=$(printf '%s\n' "${FILES[@]}")
+              RELEASE_BINARY_DIR="target/$TARGET/release"
+              RELEASE_ARCHIVE_DEST="$ARCHIVE"
+              powershell -NoProfile -Command '
+                $files = @($env:RELEASE_ARCHIVE_FILES -split "`n" | ForEach-Object {
+                  Join-Path $env:RELEASE_BINARY_DIR $_
+                })
+                Compress-Archive -LiteralPath $files -DestinationPath $env:RELEASE_ARCHIVE_DEST -Force
+              '
             else
-              # Linux (cross-compiled Windows or otherwise): `zip` is present.
-              (cd "target/$TARGET/release" && zip "$OLDPWD/$ARCHIVE" "${BINARY_NAME}${BINARY_EXT}")
+              (cd "target/$TARGET/release" && zip "$OLDPWD/$ARCHIVE" "${FILES[@]}")
             fi
           else
-            # Bundle the detached .asc (Linux binary signing) into the tarball
-            # next to the binary, so the signature travels with what it signs.
-            ASC="${BINARY_NAME}${BINARY_EXT}.asc"
-            if [ -f "target/$TARGET/release/$ASC" ]; then
-              tar czf "$ARCHIVE" -C "target/$TARGET/release" "${BINARY_NAME}${BINARY_EXT}" "$ASC"
-            else
-              tar czf "$ARCHIVE" -C "target/$TARGET/release" "${BINARY_NAME}${BINARY_EXT}"
-            fi
+            # Each Linux executable carries its own detached signature.
+            for file in "${FILES[@]}"; do
+              if [ -f "target/$TARGET/release/$file.asc" ]; then
+                FILES+=("$file.asc")
+              fi
+            done
+            tar czf "$ARCHIVE" -C "target/$TARGET/release" "${FILES[@]}"
           fi
 
       # Linux ALSO signs the packaged archive (detached .asc, top-level release
