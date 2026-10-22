@@ -407,8 +407,10 @@ jobs:
           UPLOAD_WINDOWS_EXE: ${{ inputs.upload_windows_exe }}
         run: |
           # Native Windows jq emits CRLF; keep names usable in Bash.
-          COMPANIONS=$(jq -c --arg primary "$BINARY_NAME" --arg legacy "$COMPANION_BINARY" '
-            if type != "array" or any(.[]; type != "string") then
+          COMPANIONS=$(jq -ces --arg primary "$BINARY_NAME" --arg legacy "$COMPANION_BINARY" '
+            if length != 1 then error("companion_binaries must contain one JSON array")
+            else .[0] end
+            | if type != "array" or any(.[]; type != "string") then
               error("companion_binaries must be an array of binary names")
             else . end
             | (if $legacy != "" then [$legacy] + . else . end)

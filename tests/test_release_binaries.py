@@ -123,7 +123,7 @@ class ReleaseBinaryTests(unittest.TestCase):
             self.assertCountEqual(archive.namelist(), names)
 
     def test_invalid_lists_are_rejected_before_build(self):
-        for value in ['{}', 'null', '"engine"', '[null]', '[1]',
+        for value in ['', ' ', '[] []', '["engine"] ["worker"]', '{}', 'null', '"engine"', '[null]', '[1]',
                       '["../engine"]', '["engine;false"]', '["cache"]',
                       '["engine", "engine"]', '["worker\\nengine"]']:
             with self.subTest(value=value):
