@@ -36,7 +36,7 @@ name them and `restricted_to_workflows` can stay enabled.
 
 | Workflow | Mirrored from |
 | --- | --- |
-| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@2ad104216c275e9782c93997f7638e5473881ad0` |
+| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@48b54663093ef98d2dc10b4facebba2a3302b119` |
 
 Byte-identical to its source, as every re-sync should leave it. Verify with:
 
@@ -52,7 +52,7 @@ Re-sync history:
 | 2026-08-12 | `7f61511` (tag `v11`) | initial import |
 | 2026-09-07 | `08a71c7` | `download-artifact@v7`→`@v8`, and Zondax/_workflows#132: the release job downloaded every artifact in the run, so one directory-shaped artifact aborted the upload and left kobe v0.43.0 drafted with no binaries |
 | 2026-10-21 | `ab689b6` | build, strip, sign and archive a companion executable; preserve one-binary releases |
-| 2026-10-22 | `2ad1042` (proposed) | build, strip, sign and archive a list of companions; retain the single-companion input |
+| 2026-10-22 | `48b5466` (proposed) | build, strip, sign and archive a list of companions; retain the single-companion input |
 | 2026-09-19 | `451103f` | opt-in Windows CRT/SDK cache with default-branch seeding and content verification |
 
 The `cache_windows_sysroot` input enables the versioned Microsoft CRT/SDK cache.
