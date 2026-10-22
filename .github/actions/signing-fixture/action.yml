@@ -1,0 +1,15 @@
+name: Signing fixture
+description: Record each generated signing invocation without credentials
+inputs:
+  target-path:
+    description: Fixture binary
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TARGET_PATH: ${{ inputs.target-path }}
+      run: |
+        test -f "$TARGET_PATH"
+        printf '%s\n' "$TARGET_PATH" >> signing-invocations.txt

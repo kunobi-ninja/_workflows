@@ -36,7 +36,7 @@ name them and `restricted_to_workflows` can stay enabled.
 
 | Workflow | Mirrored from |
 | --- | --- |
-| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@ab689b61b129257bc8e5b3a16484a438d1017534` |
+| `.github/workflows/_release-rust.yml` | `Zondax/_workflows@2ad104216c275e9782c93997f7638e5473881ad0` |
 
 Byte-identical to its source, as every re-sync should leave it. Verify with:
 
@@ -52,6 +52,7 @@ Re-sync history:
 | 2026-08-12 | `7f61511` (tag `v11`) | initial import |
 | 2026-09-07 | `08a71c7` | `download-artifact@v7`→`@v8`, and Zondax/_workflows#132: the release job downloaded every artifact in the run, so one directory-shaped artifact aborted the upload and left kobe v0.43.0 drafted with no binaries |
 | 2026-10-21 | `ab689b6` | build, strip, sign and archive a companion executable; preserve one-binary releases |
+| 2026-10-22 | `2ad1042` (proposed) | build, strip, sign and archive a list of companions; retain the single-companion input |
 | 2026-09-19 | `451103f` | opt-in Windows CRT/SDK cache with default-branch seeding and content verification |
 
 The `cache_windows_sysroot` input enables the versioned Microsoft CRT/SDK cache.
@@ -120,3 +121,22 @@ Confirmed working this way on 2026-08-12: claimed by `mac-runner-2` in
 This workflow calls `zondax/actions/*` (signing, checkout) as **step-level
 actions**. Those are actions, not reusable workflows, so they play no part in
 runner-group authorization and deliberately still point at `Zondax`.
+
+## Multiple release binaries
+
+Pass companion executable names as a JSON array:
+
+```yaml
+with:
+  binary_name: kache
+  companion_binaries: '["kache-engine", "kache-worker"]'
+  upload_windows_exe: false
+```
+
+Each companion is built, stripped, signed and included in the primary binary's
+archive. Linux archives include each executable's detached signature. Debian
+assets remain controlled by the consumer's Cargo metadata.
+
+`companion_binary` remains compatible and is combined with the array. Names must
+be unique, differ from the primary name and contain no directory separators.
+Bare Windows EXE assets cannot install companions; use the ZIP archive.

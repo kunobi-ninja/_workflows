@@ -12,9 +12,14 @@ on:
         default: kache
         type: string
       companion_binary:
-        description: "Optional second binary to build, strip, sign and include in each archive. Archive installers are required; incompatible with upload_windows_exe."
+        description: "Legacy single companion. Combined with companion_binaries; names must be distinct. Use archives when companions are present."
         required: false
         default: ""
+        type: string
+      companion_binaries:
+        description: 'JSON array of additional binaries to build, strip, sign and archive, e.g. ["kache-engine", "kache-worker"]. Incompatible with upload_windows_exe.'
+        required: false
+        default: "[]"
         type: string
       targets:
         description: "JSON array of Rust target triples to build"
@@ -393,13 +398,36 @@ jobs:
         if: matrix.use_xwin && inputs.cache_windows_sysroot
         uses: Zondax/_workflows/.github/actions/windows-sysroot@c8cbba84fac31aabd59bf238e38bf5e83ec8891b
 
+      - name: Resolve release binaries
+        id: binaries
+        env:
+          BINARY_NAME: ${{ inputs.binary_name }}
+          COMPANION_BINARY: ${{ inputs.companion_binary }}
+          COMPANION_BINARIES: ${{ inputs.companion_binaries }}
+          UPLOAD_WINDOWS_EXE: ${{ inputs.upload_windows_exe }}
+        run: |
+          COMPANIONS=$(jq -c --arg primary "$BINARY_NAME" --arg legacy "$COMPANION_BINARY" '
+            if type != "array" or any(.[]; type != "string") then
+              error("companion_binaries must be an array of binary names")
+            else . end
+            | (if $legacy != "" then [$legacy] + . else . end)
+            | if any(.[]; (test("^[a-zA-Z0-9][a-zA-Z0-9._-]*$") | not) or . == $primary) then
+                error("companions must name distinct binaries without directories")
+              elif (unique | length) != length then error("duplicate companion binary")
+              else . end
+          ' <<<"$COMPANION_BINARIES")
+          if [ "$COMPANIONS" != "[]" ] && [ "$UPLOAD_WINDOWS_EXE" = "true" ]; then
+            echo "A bare Windows executable cannot install companions; use the ZIP archive" >&2
+            exit 1
+          fi
+          NAMES=$(jq -c --arg primary "$BINARY_NAME" '[$primary] + .' <<<"$COMPANIONS")
+          echo "names=$NAMES" >> "$GITHUB_OUTPUT"
+
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           BUILD_ARGS: ${{ inputs.build_args }}
-          BINARY_NAME: ${{ inputs.binary_name }}
-          COMPANION_BINARY: ${{ inputs.companion_binary }}
-          UPLOAD_WINDOWS_EXE: ${{ inputs.upload_windows_exe }}
+          BINARIES_JSON: ${{ steps.binaries.outputs.names }}
           CROSS_REMOTE: ${{ matrix.use_cross && '1' || '' }}
         run: |
           BUILD_CMD="cargo build"
@@ -409,16 +437,10 @@ jobs:
             BUILD_CMD="cargo xwin build"
           fi
           BIN_ARGS=()
-          if [ -n "$COMPANION_BINARY" ]; then
-            if [[ ! "$COMPANION_BINARY" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || [ "$COMPANION_BINARY" = "$BINARY_NAME" ]; then
-              echo "companion_binary must name a distinct binary without directories" >&2
-              exit 1
-            fi
-            if [ "$UPLOAD_WINDOWS_EXE" = "true" ]; then
-              echo "A bare Windows executable cannot install a companion; use the ZIP archive" >&2
-              exit 1
-            fi
-            BIN_ARGS=(--bin "$BINARY_NAME" --bin "$COMPANION_BINARY")
+          if [ "$(jq length <<<"$BINARIES_JSON")" -gt 1 ]; then
+            while IFS= read -r name; do
+              BIN_ARGS+=(--bin "$name")
+            done < <(jq -r '.[]' <<<"$BINARIES_JSON")
           fi
           $BUILD_CMD --release --target "$TARGET" $BUILD_ARGS "${BIN_ARGS[@]}"
 
@@ -426,19 +448,14 @@ jobs:
         if: inputs.strip_binaries
         env:
           TARGET: ${{ matrix.target }}
-          BINARY_NAME: ${{ inputs.binary_name }}
-          COMPANION_BINARY: ${{ inputs.companion_binary }}
+          BINARIES_JSON: ${{ steps.binaries.outputs.names }}
           BINARY_EXT: ${{ matrix.binary_ext }}
         run: |
           if [[ "$TARGET" == *"windows"* ]]; then
             echo "Skipping strip for Windows"
             exit 0
           fi
-          BINARIES=("$BINARY_NAME")
-          if [ -n "$COMPANION_BINARY" ]; then
-            BINARIES+=("$COMPANION_BINARY")
-          fi
-          for name in "${BINARIES[@]}"; do
+          while IFS= read -r name; do
             BIN="target/$TARGET/release/${name}${BINARY_EXT}"
             if [ "${{ matrix.use_cross }}" = "true" ]; then
               docker run --rm -v "$(pwd):/workspace" -w /workspace \
@@ -447,34 +464,64 @@ jobs:
             else
               strip "$BIN"
             fi
-          done
+          done < <(jq -r '.[]' <<<"$BINARIES_JSON")
 
-      # --- Code signing: all platforms sign the BINARY before packaging.
-      #     macOS/Windows embed the signature in the binary; Linux produces a
-      #     detached .asc that gets bundled into the archive next to the binary. ---
-      - name: Sign macOS binary
-        if: inputs.enable_signing && contains(matrix.target, 'apple-darwin')
-        uses: zondax/actions/sign-macos-binary@v1
-        with:
-          binary-path: target/${{ matrix.target }}/release/${{ inputs.binary_name }}
-          workload-identity-provider: ${{ secrets.codesign_wif_provider }}
-          gcp-project: ${{ secrets.codesign_gcp_project }}
-          service-account: ${{ secrets.codesign_service_account }}
-          notarize: ${{ inputs.notarize_macos }}
-          entitlements: ${{ inputs.macos_entitlements }}
-          rcodesign-sha256: ${{ inputs.rcodesign_sha256 }}
+      # Local composite actions are loaded when their step starts. Generate
+      # one invocation of the existing signing action per validated binary.
+      - name: Prepare binary signing
+        if: inputs.enable_signing
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_EXT: ${{ matrix.binary_ext }}
+          BINARIES_JSON: ${{ steps.binaries.outputs.names }}
+        run: |
+          python3 - <<'SIGNING'
+          import json
+          import os
+          from pathlib import Path
 
-      - name: Sign macOS companion
-        if: inputs.companion_binary != '' && inputs.enable_signing && contains(matrix.target, 'apple-darwin')
-        uses: zondax/actions/sign-macos-binary@v1
-        with:
-          binary-path: target/${{ matrix.target }}/release/${{ inputs.companion_binary }}
-          workload-identity-provider: ${{ secrets.codesign_wif_provider }}
-          gcp-project: ${{ secrets.codesign_gcp_project }}
-          service-account: ${{ secrets.codesign_service_account }}
-          notarize: ${{ inputs.notarize_macos }}
-          entitlements: ${{ inputs.macos_entitlements }}
-          rcodesign-sha256: ${{ inputs.rcodesign_sha256 }}
+          target = os.environ["TARGET"]
+          configurations = {
+              "apple-darwin": ("macos", {
+                  "workload-identity-provider": "codesign_wif_provider",
+                  "gcp-project": "codesign_gcp_project",
+                  "service-account": "codesign_service_account",
+                  "notarize": "notarize_macos",
+                  "entitlements": "macos_entitlements",
+                  "rcodesign-sha256": "rcodesign_sha256",
+              }),
+              "windows": ("windows", {
+                  "gcp-access-token": "gcp_access_token",
+                  "kms-keyring": "codesign_kms_keyring",
+                  "kms-key-alias": "codesign_kms_key_alias",
+                  "cert-chain": "windows_cert_chain",
+                  "jsign-sha256": "jsign_sha256",
+              }),
+              "linux": ("linux", {
+                  "workload-identity-provider": "pgp_sign_wif_provider",
+                  "gcp-project-id": "pgp_sign_gcp_project_id",
+                  "service-account": "pgp_sign_service_account",
+                  "signer-token": "pgp_signer_token",
+                  "kms-key": "pgp_sign_kms_key_version",
+                  "cert-base64": "pgp_cert_base64",
+              }),
+          }
+          platform, mapping = next(value for key, value in configurations.items() if key in target)
+          path_key = "target-path" if platform == "linux" else "binary-path"
+          steps = []
+          for binary in json.loads(os.environ["BINARIES_JSON"]):
+              arguments = {key: "${" + "{ inputs." + value + " }}" for key, value in mapping.items()}
+              arguments[path_key] = f"target/{target}/release/{binary}{os.environ['BINARY_EXT']}"
+              steps.append({"name": f"Sign {binary}",
+                            "uses": f"zondax/actions/sign-{platform}-binary@v1", "with": arguments})
+          action = {"name": "Sign release binaries", "description": "Sign each selected release binary",
+                    "inputs": {name: {"description": name, "required": False}
+                               for _, values in configurations.values() for name in values.values()},
+                    "runs": {"using": "composite", "steps": steps}}
+          directory = Path(".release-binary-signing")
+          directory.mkdir(exist_ok=True)
+          (directory / "action.yml").write_text(json.dumps(action, indent=2) + "\n")
+          SIGNING
 
       - name: Authenticate with GCP (Authenticode)
         id: auth-codesign
@@ -489,65 +536,41 @@ jobs:
           setup_gcloud: 'false'
           verify_authentication: 'false'
 
-      - name: Sign Windows binary
-        if: inputs.enable_signing && contains(matrix.target, 'windows')
-        uses: zondax/actions/sign-windows-binary@v1
+      - name: Sign release binaries
+        if: inputs.enable_signing
+        uses: ./.release-binary-signing
         with:
-          binary-path: target/${{ matrix.target }}/release/${{ inputs.binary_name }}.exe
-          gcp-access-token: ${{ steps.auth-codesign.outputs.access_token }}
-          kms-keyring: ${{ secrets.codesign_kms_keyring }}
-          kms-key-alias: ${{ secrets.codesign_kms_key_alias }}
-          cert-chain: ${{ secrets.windows_cert_chain }}
-          jsign-sha256: ${{ inputs.jsign_sha256 }}
-
-      - name: Sign Windows companion
-        if: inputs.companion_binary != '' && inputs.enable_signing && contains(matrix.target, 'windows')
-        uses: zondax/actions/sign-windows-binary@v1
-        with:
-          binary-path: target/${{ matrix.target }}/release/${{ inputs.companion_binary }}.exe
-          gcp-access-token: ${{ steps.auth-codesign.outputs.access_token }}
-          kms-keyring: ${{ secrets.codesign_kms_keyring }}
-          kms-key-alias: ${{ secrets.codesign_kms_key_alias }}
-          cert-chain: ${{ secrets.windows_cert_chain }}
-          jsign-sha256: ${{ inputs.jsign_sha256 }}
-
-      - name: Sign Linux binary
-        if: inputs.enable_signing && contains(matrix.target, 'linux')
-        uses: zondax/actions/sign-linux-binary@v1
-        with:
-          target-path: target/${{ matrix.target }}/release/${{ inputs.binary_name }}
-          workload-identity-provider: ${{ secrets.pgp_sign_wif_provider }}
-          gcp-project-id: ${{ secrets.pgp_sign_gcp_project_id }}
-          service-account: ${{ secrets.pgp_sign_service_account }}
-          signer-token: ${{ secrets.pgp_signer_token }}
-          kms-key: ${{ secrets.pgp_sign_kms_key_version }}
-          cert-base64: ${{ secrets.pgp_cert_base64 }}
-
-      - name: Sign Linux companion
-        if: inputs.companion_binary != '' && inputs.enable_signing && contains(matrix.target, 'linux')
-        uses: zondax/actions/sign-linux-binary@v1
-        with:
-          target-path: target/${{ matrix.target }}/release/${{ inputs.companion_binary }}
-          workload-identity-provider: ${{ secrets.pgp_sign_wif_provider }}
-          gcp-project-id: ${{ secrets.pgp_sign_gcp_project_id }}
-          service-account: ${{ secrets.pgp_sign_service_account }}
-          signer-token: ${{ secrets.pgp_signer_token }}
-          kms-key: ${{ secrets.pgp_sign_kms_key_version }}
-          cert-base64: ${{ secrets.pgp_cert_base64 }}
+          codesign_wif_provider: ${{ secrets.codesign_wif_provider }}
+          codesign_gcp_project: ${{ secrets.codesign_gcp_project }}
+          codesign_service_account: ${{ secrets.codesign_service_account }}
+          notarize_macos: ${{ inputs.notarize_macos }}
+          macos_entitlements: ${{ inputs.macos_entitlements }}
+          rcodesign_sha256: ${{ inputs.rcodesign_sha256 }}
+          gcp_access_token: ${{ steps.auth-codesign.outputs.access_token }}
+          codesign_kms_keyring: ${{ secrets.codesign_kms_keyring }}
+          codesign_kms_key_alias: ${{ secrets.codesign_kms_key_alias }}
+          windows_cert_chain: ${{ secrets.windows_cert_chain }}
+          jsign_sha256: ${{ inputs.jsign_sha256 }}
+          pgp_sign_wif_provider: ${{ secrets.pgp_sign_wif_provider }}
+          pgp_sign_gcp_project_id: ${{ secrets.pgp_sign_gcp_project_id }}
+          pgp_sign_service_account: ${{ secrets.pgp_sign_service_account }}
+          pgp_signer_token: ${{ secrets.pgp_signer_token }}
+          pgp_sign_kms_key_version: ${{ secrets.pgp_sign_kms_key_version }}
+          pgp_cert_base64: ${{ secrets.pgp_cert_base64 }}
 
       - name: Package
         env:
           TARGET: ${{ matrix.target }}
           BINARY_NAME: ${{ inputs.binary_name }}
-          COMPANION_BINARY: ${{ inputs.companion_binary }}
+          BINARIES_JSON: ${{ steps.binaries.outputs.names }}
           BINARY_EXT: ${{ matrix.binary_ext }}
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
         run: |
           ARCHIVE="${BINARY_NAME}-${TARGET}.${ARCHIVE_EXT}"
-          FILES=("${BINARY_NAME}${BINARY_EXT}")
-          if [ -n "$COMPANION_BINARY" ]; then
-            FILES+=("${COMPANION_BINARY}${BINARY_EXT}")
-          fi
+          FILES=()
+          while IFS= read -r name; do
+            FILES+=("${name}${BINARY_EXT}")
+          done < <(jq -r '.[]' <<<"$BINARIES_JSON")
           for file in "${FILES[@]}"; do
             test -f "target/$TARGET/release/$file"
           done
