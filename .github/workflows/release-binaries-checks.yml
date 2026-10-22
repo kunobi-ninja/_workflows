@@ -6,6 +6,8 @@ on:
       - .github/workflows/_release-rust.yml
       - .github/workflows/release-binaries-checks.yml
       - tests/test_release_binaries.py
+      - tests/prepare_signing_smoke.py
+      - .github/actions/signing-fixture/action.yml
   workflow_dispatch:
 
 permissions:
@@ -23,3 +25,14 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Check archive contents and invalid build configuration
         run: python -m unittest discover -s tests -p test_release_binaries.py -v
+      - name: Prepare generated composite smoke test
+        run: python tests/prepare_signing_smoke.py
+      - name: Exercise generated signing invocations
+        uses: ./.release-binary-signing
+      - name: Check every binary reached signing
+        shell: bash
+        run: |
+          test "$(wc -l < signing-invocations.txt | tr -d ' ')" = 3
+          grep -Fx 'target/x86_64-unknown-linux-musl/release/cache' signing-invocations.txt
+          grep -Fx 'target/x86_64-unknown-linux-musl/release/engine' signing-invocations.txt
+          grep -Fx 'target/x86_64-unknown-linux-musl/release/worker' signing-invocations.txt
